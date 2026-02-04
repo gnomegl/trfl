@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+
+# @describe Scan target with trufflehog and convert results to CSV
+# @meta require-tools trufflehog,jq
+# @arg target=. Target file or directory to scan
+# @option -r --results=verified <TYPE> Results type [verified|unverified|unknown]
+# @option -o --output <NAME> Base name for output files (auto-detected if not provided)
+# @flag -j --json-only Output only JSONL, skip CSV conversion
+# @flag -q --quiet Suppress progress output
+# @flag -v --verbose Enable verbose output
+
+eval "$(argc --argc-eval "$0" "$@")"
+
+# Setup colors
+setup_colors() {
+  if [[ "$argc_quiet" == 1 ]] || [[ -z "$TERM" ]] || [[ "$TERM" == "dumb" ]]; then
+    bold="" reset="" blue="" green="" yellow="" cyan="" red=""
+  else
+    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
+    yellow=$(tput setaf 3) cyan=$(tput setaf 6) red=$(tput setaf 1)
+  fi
+}
+setup_colors
+
+log() { [[ -z "$argc_quiet" ]] && printf "%s\n" "$*" >&2; }
+log_verbose() { [[ -n "$argc_verbose" ]] && printf "${blue}::${reset} %s\n" "$*" >&2; }
+die() { printf "${red}Error:${reset} %s\n" "$*" >&2; exit 1; }
+
+# Validate results type
+validate_results_type() {
+  case "$argc_results" in
+    verified|unverified|unknown) return 0 ;;
+    *) die "Invalid results type: $argc_results (valid: verified, unverified, unknown)" ;;
+  esac
+}
+
+# Determine base name for output files
+get_base_name() {
+  if [[ -n "$argc_output" ]]; then
+    echo "$argc_output"
+  elif [[ -f "$argc_target" ]]; then
+    local base
+    base=$(basename "$argc_target")
+    echo "${base%.*}"
+  elif [[ -d "$argc_target" ]]; then
+    basename "$argc_target"
+  else
+    echo "results"
+  fi
+}
+
+# Validate target exists
+validate_target() {
+  [[ -e "$argc_target" ]] || die "Target does not exist: $argc_target"
+}
+
+# Draw progress bar
+draw_progress() {
+  local current="$1" total="$2" label="$3" width=30
+  [[ $total -eq 0 ]] && total=1
+  [[ $current -gt $total ]] && current=$total
+  
+  local percent=$((current * 100 / total))
+  local filled=$((current * width / total))
+  local empty=$((width - filled))
+  local bar=""
+  
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=0; i<empty; i++)); do bar+="░"; done
+  
+  printf "\r${cyan}[${green}%s${cyan}]${reset} %3d%% (%d/%d %s)" \
+    "$bar" "$percent" "$current" "$total" "$label" >&2
+}
+
+# Count total items for progress
+count_items() {
+  if [[ -f "$argc_target" ]]; then
+    wc -l < "$argc_target"
+  else
+    find "$argc_target" -type f 2>/dev/null | wc -l
+  fi
+}
+
+# Run trufflehog scan with progress
+run_scan() {
+  local jsonl_file="$1"
+  
+  log_verbose "Target: $argc_target"
+  log_verbose "Results type: $argc_results"
+  log_verbose "Output: $jsonl_file"
+  
+  local total_items item_type
+  total_items=$(count_items)
+  
+  if [[ -f "$argc_target" ]]; then
+    item_type="lines"
+  else
+    item_type="files"
+  fi
+  
+  if [[ -z "$argc_quiet" ]]; then
+    log "${cyan}Scanning...${reset}"
+    draw_progress 0 "$total_items" "$item_type"
+    
+    local processed=0
+    > "$jsonl_file"
+    
+    # Track unique source files from results to estimate progress
+    declare -A seen_files
+    
+    trufflehog filesystem "$argc_target" --results "$argc_results" -j 2>/dev/null | \
+    while IFS= read -r line; do
+      echo "$line" >> "$jsonl_file"
+      
+      # Extract source file from JSON to track unique files scanned
+      local src_file
+      src_file=$(echo "$line" | jq -r '.SourceMetadata.Data.Filesystem.file // empty' 2>/dev/null)
+      
+      if [[ -n "$src_file" && -z "${seen_files[$src_file]:-}" ]]; then
+        seen_files["$src_file"]=1
+        ((processed++))
+        draw_progress "$processed" "$total_items" "$item_type"
+      fi
+    done
+    
+    # Show 100% at end
+    draw_progress "$total_items" "$total_items" "$item_type"
+    printf "\n" >&2
+  else
+    if ! trufflehog filesystem "$argc_target" --results "$argc_results" -j 2>/dev/null > "$jsonl_file"; then
+      die "Trufflehog scan failed"
+    fi
+  fi
+  
+  local count
+  count=$(wc -l < "$jsonl_file")
+  log "${green}Found ${bold}${count}${reset}${green} results${reset}"
+}
+
+# Convert JSONL to CSV
+convert_to_csv() {
+  local jsonl_file="$1"
+  local csv_file="$2"
+  
+  log_verbose "Converting to CSV: $csv_file"
+  
+  # Print header once, then process each line
+  {
+    echo '"Verified","DetectorName","Raw","RawV2","ExtraData"'
+    jq -r '[
+      .Verified,
+      .DetectorName,
+      (.Raw | gsub("\n"; " ")),
+      (.RawV2 // "" | gsub("\n"; " ")),
+      (.ExtraData | if . == null then "" else (tostring | gsub("\n"; " ")) end)
+    ] | @csv' "$jsonl_file"
+  } | awk '!seen[$0]++' > "$csv_file"
+  
+  if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+    die "CSV conversion failed"
+  fi
+}
+
+# Main execution
+main() {
+  validate_results_type
+  validate_target
+  
+  local base_name jsonl_file csv_file
+  base_name=$(get_base_name)
+  jsonl_file="${base_name}.jsonl"
+  csv_file="${base_name}.csv"
+  
+  run_scan "$jsonl_file"
+  
+  if [[ -z "$argc_json_only" ]]; then
+    convert_to_csv "$jsonl_file" "$csv_file"
+    log "\n${green}Done:${reset} ${cyan}$jsonl_file${reset}, ${cyan}$csv_file${reset}"
+  else
+    log "\n${green}Done:${reset} ${cyan}$jsonl_file${reset}"
+  fi
+}
+
+main
