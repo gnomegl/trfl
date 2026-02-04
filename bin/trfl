@@ -336,7 +336,34 @@ validate_target() {
   [[ -e "$argc_target" ]] || die "Target does not exist: $argc_target"
 }
 
-# Run trufflehog scan
+# Draw progress bar
+draw_progress() {
+  local current="$1" total="$2" label="$3" width=30
+  [[ $total -eq 0 ]] && total=1
+  [[ $current -gt $total ]] && current=$total
+  
+  local percent=$((current * 100 / total))
+  local filled=$((current * width / total))
+  local empty=$((width - filled))
+  local bar=""
+  
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=0; i<empty; i++)); do bar+="░"; done
+  
+  printf "\r${cyan}[${green}%s${cyan}]${reset} %3d%% (%d/%d %s)" \
+    "$bar" "$percent" "$current" "$total" "$label" >&2
+}
+
+# Count total items for progress
+count_items() {
+  if [[ -f "$argc_target" ]]; then
+    wc -l < "$argc_target"
+  else
+    find "$argc_target" -type f 2>/dev/null | wc -l
+  fi
+}
+
+# Run trufflehog scan with progress
 run_scan() {
   local jsonl_file="$1"
   
@@ -344,10 +371,47 @@ run_scan() {
   log_verbose "Results type: $argc_results"
   log_verbose "Output: $jsonl_file"
   
-  log "${cyan}Scanning...${reset}"
+  local total_items item_type
+  total_items=$(count_items)
   
-  if ! trufflehog filesystem "$argc_target" --results "$argc_results" -j 2>/dev/null > "$jsonl_file"; then
-    die "Trufflehog scan failed"
+  if [[ -f "$argc_target" ]]; then
+    item_type="lines"
+  else
+    item_type="files"
+  fi
+  
+  if [[ -z "$argc_quiet" ]]; then
+    log "${cyan}Scanning...${reset}"
+    draw_progress 0 "$total_items" "$item_type"
+    
+    local processed=0
+    > "$jsonl_file"
+    
+    # Track unique source files from results to estimate progress
+    declare -A seen_files
+    
+    trufflehog filesystem "$argc_target" --results "$argc_results" -j 2>/dev/null | \
+    while IFS= read -r line; do
+      echo "$line" >> "$jsonl_file"
+      
+      # Extract source file from JSON to track unique files scanned
+      local src_file
+      src_file=$(echo "$line" | jq -r '.SourceMetadata.Data.Filesystem.file // empty' 2>/dev/null)
+      
+      if [[ -n "$src_file" && -z "${seen_files[$src_file]:-}" ]]; then
+        seen_files["$src_file"]=1
+        ((processed++))
+        draw_progress "$processed" "$total_items" "$item_type"
+      fi
+    done
+    
+    # Show 100% at end
+    draw_progress "$total_items" "$total_items" "$item_type"
+    printf "\n" >&2
+  else
+    if ! trufflehog filesystem "$argc_target" --results "$argc_results" -j 2>/dev/null > "$jsonl_file"; then
+      die "Trufflehog scan failed"
+    fi
   fi
   
   local count
