@@ -131,19 +131,35 @@ run_scan() {
     
     > "$jsonl_file"
     
-    # Use --log-level=3 to get "scanning file" messages on stderr for progress tracking
     # Use named pipe to process stderr while capturing stdout to file
-    local fifo
+    # For archives, use --log-level=4 to get "Opened file successfully" messages
+    # For regular files/dirs, use --log-level=3 for "scanning file" messages
+    local fifo log_level
     fifo=$(mktemp -u)
     mkfifo "$fifo"
+    
+    if [[ -f "$argc_target" ]] && is_archive "$argc_target"; then
+      log_level=4
+    else
+      log_level=3
+    fi
     
     # Process stderr in background for progress updates
     {
       local processed=0
       declare -A seen_files
       while IFS= read -r line; do
-        # Check if this is a "scanning file" log message
-        if [[ "$line" == *'"msg":"scanning file"'* ]]; then
+        # For archives: track "Opened file successfully" messages (log-level 4)
+        # For dirs/regular files: track "scanning file" messages (log-level 3)
+        if [[ "$line" == *'"msg":"Opened file successfully"'* ]]; then
+          local filename
+          filename=$(echo "$line" | jq -r '.filename // empty' 2>/dev/null)
+          if [[ -n "$filename" && -z "${seen_files[$filename]:-}" ]]; then
+            seen_files["$filename"]=1
+            ((processed++))
+            draw_progress "$processed" "$total_items" "$item_type"
+          fi
+        elif [[ "$line" == *'"msg":"scanning file"'* ]]; then
           local scanned_path
           scanned_path=$(echo "$line" | jq -r '.path // empty' 2>/dev/null)
           if [[ -n "$scanned_path" && -z "${seen_files[$scanned_path]:-}" ]]; then
@@ -157,7 +173,7 @@ run_scan() {
     local progress_pid=$!
     
     # Run trufflehog: stdout to jsonl file, stderr to fifo for progress
-    trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level=3 \
+    trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level="$log_level" \
       > "$jsonl_file" 2>"$fifo"
     
     wait "$progress_pid" 2>/dev/null || true
