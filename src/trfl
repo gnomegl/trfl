@@ -26,6 +26,29 @@ log() { [[ -z "$argc_quiet" ]] && printf "%s\n" "$*" >&2; }
 log_verbose() { [[ -n "$argc_verbose" ]] && printf "${blue}::${reset} %s\n" "$*" >&2; }
 die() { printf "${red}Error:${reset} %s\n" "$*" >&2; exit 1; }
 
+# Check if file is an archive type
+is_archive() {
+  local file="$1"
+  case "${file,,}" in
+    *.zip|*.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.gz|*.bz2|*.xz|*.7z|*.rar) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Count files in archive
+count_archive_files() {
+  local file="$1"
+  case "${file,,}" in
+    *.zip) unzip -l "$file" 2>/dev/null | tail -1 | awk '{print $2}' ;;
+    *.tar) tar -tf "$file" 2>/dev/null | wc -l ;;
+    *.tar.gz|*.tgz) tar -tzf "$file" 2>/dev/null | wc -l ;;
+    *.tar.bz2|*.tbz2) tar -tjf "$file" 2>/dev/null | wc -l ;;
+    *.tar.xz|*.txz) tar -tJf "$file" 2>/dev/null | wc -l ;;
+    *.7z) 7z l "$file" 2>/dev/null | grep -c "^[0-9]" ;;
+    *) echo 1 ;;  # Fallback for unknown archive types
+  esac
+}
+
 # Validate results type
 validate_results_type() {
   case "$argc_results" in
@@ -75,7 +98,11 @@ draw_progress() {
 # Count total items for progress
 count_items() {
   if [[ -f "$argc_target" ]]; then
-    wc -l < "$argc_target"
+    if is_archive "$argc_target"; then
+      count_archive_files "$argc_target"
+    else
+      wc -l < "$argc_target"
+    fi
   else
     find "$argc_target" -type f 2>/dev/null | wc -l
   fi
@@ -92,7 +119,7 @@ run_scan() {
   local total_items item_type
   total_items=$(count_items)
   
-  if [[ -f "$argc_target" ]]; then
+  if [[ -f "$argc_target" ]] && ! is_archive "$argc_target"; then
     item_type="lines"
   else
     item_type="files"
