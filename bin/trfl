@@ -377,13 +377,37 @@ draw_progress() {
     "$bar" "$percent" "$current" "$total" "$label" >&2
 }
 
+# Draw spinner with message
+draw_spinner() {
+  local frame="$1" label="$2"
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local spinner="${frames[$((frame % ${#frames[@]}))]}"
+  printf "\r${cyan}%s${reset} %s" "$spinner" "$label" >&2
+}
+
+# Draw final result for spinner mode
+draw_spinner_done() {
+  local chunks="$1"
+  printf "\r${green}✓${reset} Scanned %d chunks\n" "$chunks" >&2
+}
+
+# Estimate chunks for a single file (trufflehog uses ~12KB chunks)
+estimate_file_chunks() {
+  local file="$1"
+  local size
+  size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+  local chunks=$(( (size + 12000 - 1) / 12000 ))  # Round up
+  [[ $chunks -lt 1 ]] && chunks=1
+  echo "$chunks"
+}
+
 # Count total items for progress
 count_items() {
   if [[ -f "$argc_target" ]]; then
     if is_archive "$argc_target"; then
       count_archive_files "$argc_target"
     else
-      echo 1  # Single file = 1 item, tracked via trufflehog's "scanning file" message
+      estimate_file_chunks "$argc_target"  # Estimate chunks based on file size
     fi
   else
     find "$argc_target" -type f 2>/dev/null | wc -l
@@ -398,68 +422,110 @@ run_scan() {
   log_verbose "Results type: $argc_results"
   log_verbose "Output: $jsonl_file"
   
-  local total_items item_type
+  local total_items item_type is_single_file=false
   total_items=$(count_items)
   
-  item_type="files"  # Always track files, based on trufflehog's verbose "scanning file" messages
+  if [[ -f "$argc_target" ]] && ! is_archive "$argc_target"; then
+    is_single_file=true
+    item_type="chunks"
+  else
+    item_type="files"
+  fi
   
   if [[ -z "$argc_quiet" ]]; then
-    log "${cyan}Scanning...${reset}"
-    draw_progress 0 "$total_items" "$item_type"
-    
     > "$jsonl_file"
     
     # Use named pipe to process stderr while capturing stdout to file
-    # For archives, use --log-level=4 to get "Opened file successfully" messages
-    # For regular files/dirs, use --log-level=3 for "scanning file" messages
+    # Log levels: 0=info, 3=scanning file, 4=opened file (archives)
     local fifo log_level
     fifo=$(mktemp -u)
     mkfifo "$fifo"
     
-    if [[ -f "$argc_target" ]] && is_archive "$argc_target"; then
-      log_level=4
+    if [[ -f "$argc_target" ]]; then
+      if is_archive "$argc_target"; then
+        log_level=4  # Archives: "Opened file successfully" messages
+      else
+        log_level=0  # Single files: "finished scanning" message with chunks count
+      fi
     else
-      log_level=3
+      log_level=3    # Directories: "scanning file" messages
     fi
     
-    # Process stderr in background for progress updates
-    {
-      local processed=0
-      declare -A seen_files
-      while IFS= read -r line; do
-        # For archives: track "Opened file successfully" messages (log-level 4)
-        # For dirs/regular files: track "scanning file" messages (log-level 3)
-        if [[ "$line" == *'"msg":"Opened file successfully"'* ]]; then
-          local filename
-          filename=$(echo "$line" | jq -r '.filename // empty' 2>/dev/null)
-          if [[ -n "$filename" && -z "${seen_files[$filename]:-}" ]]; then
-            seen_files["$filename"]=1
-            ((processed++))
-            draw_progress "$processed" "$total_items" "$item_type"
+    if [[ "$is_single_file" == true ]]; then
+      # Single file: use spinner since trufflehog doesn't provide incremental progress
+      local spinner_frame=0 actual_chunks=0
+      
+      # Start spinner in background
+      {
+        while true; do
+          draw_spinner "$spinner_frame" "Scanning file..."
+          ((spinner_frame++))
+          sleep 0.1
+        done
+      } &
+      local spinner_pid=$!
+      
+      # Capture stderr to extract chunk count
+      local stderr_file
+      stderr_file=$(mktemp)
+      
+      trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level=0 \
+        > "$jsonl_file" 2>"$stderr_file"
+      
+      # Stop spinner
+      kill "$spinner_pid" 2>/dev/null
+      wait "$spinner_pid" 2>/dev/null || true
+      
+      # Extract chunk count from stderr
+      actual_chunks=$(grep '"finished scanning"' "$stderr_file" | jq -r '.chunks // 0' 2>/dev/null)
+      rm -f "$stderr_file"
+      
+      [[ -z "$actual_chunks" || "$actual_chunks" == "0" ]] && actual_chunks=1
+      draw_spinner_done "$actual_chunks"
+    else
+      # Directory/archive: use progress bar with incremental updates
+      log "${cyan}Scanning...${reset}"
+      draw_progress 0 "$total_items" "$item_type"
+      
+      # Process stderr in background for progress updates
+      {
+        local processed=0
+        declare -A seen_files
+        while IFS= read -r line; do
+          # For archives: track "Opened file successfully" messages (log-level 4)
+          if [[ "$line" == *'"msg":"Opened file successfully"'* ]]; then
+            local filename
+            filename=$(echo "$line" | jq -r '.filename // empty' 2>/dev/null)
+            if [[ -n "$filename" && -z "${seen_files[$filename]:-}" ]]; then
+              seen_files["$filename"]=1
+              ((processed++))
+              draw_progress "$processed" "$total_items" "$item_type"
+            fi
+          # For directories: track "scanning file" messages (log-level 3)
+          elif [[ "$line" == *'"msg":"scanning file"'* ]]; then
+            local scanned_path
+            scanned_path=$(echo "$line" | jq -r '.path // empty' 2>/dev/null)
+            if [[ -n "$scanned_path" && -z "${seen_files[$scanned_path]:-}" ]]; then
+              seen_files["$scanned_path"]=1
+              ((processed++))
+              draw_progress "$processed" "$total_items" "$item_type"
+            fi
           fi
-        elif [[ "$line" == *'"msg":"scanning file"'* ]]; then
-          local scanned_path
-          scanned_path=$(echo "$line" | jq -r '.path // empty' 2>/dev/null)
-          if [[ -n "$scanned_path" && -z "${seen_files[$scanned_path]:-}" ]]; then
-            seen_files["$scanned_path"]=1
-            ((processed++))
-            draw_progress "$processed" "$total_items" "$item_type"
-          fi
-        fi
-      done < "$fifo"
-    } &
-    local progress_pid=$!
-    
-    # Run trufflehog: stdout to jsonl file, stderr to fifo for progress
-    trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level="$log_level" \
-      > "$jsonl_file" 2>"$fifo"
-    
-    wait "$progress_pid" 2>/dev/null || true
-    rm -f "$fifo"
-    
-    # Show 100% at end
-    draw_progress "$total_items" "$total_items" "$item_type"
-    printf "\n" >&2
+        done < "$fifo"
+      } &
+      local progress_pid=$!
+      
+      # Run trufflehog: stdout to jsonl file, stderr to fifo for progress
+      trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level="$log_level" \
+        > "$jsonl_file" 2>"$fifo"
+      
+      wait "$progress_pid" 2>/dev/null || true
+      rm -f "$fifo"
+      
+      # Show 100% at end
+      draw_progress "$total_items" "$total_items" "$item_type"
+      printf "\n" >&2
+    fi
   else
     if ! trufflehog filesystem "$argc_target" --results "$argc_results" -j 2>/dev/null > "$jsonl_file"; then
       die "Trufflehog scan failed"
