@@ -383,7 +383,7 @@ count_items() {
     if is_archive "$argc_target"; then
       count_archive_files "$argc_target"
     else
-      wc -l < "$argc_target"
+      echo 1  # Single file = 1 item, tracked via trufflehog's "scanning file" message
     fi
   else
     find "$argc_target" -type f 2>/dev/null | wc -l
@@ -401,11 +401,7 @@ run_scan() {
   local total_items item_type
   total_items=$(count_items)
   
-  if [[ -f "$argc_target" ]] && ! is_archive "$argc_target"; then
-    item_type="lines"
-  else
-    item_type="files"
-  fi
+  item_type="files"  # Always track files, based on trufflehog's verbose "scanning file" messages
   
   if [[ -z "$argc_quiet" ]]; then
     log "${cyan}Scanning...${reset}"
