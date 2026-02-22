@@ -3,7 +3,7 @@
 # @describe Scan target with trufflehog and convert results to CSV
 # @meta require-tools trufflehog,jq
 # @arg target=. Target file or directory to scan
-# @option -r --results=verified <TYPE> Results type [verified|unverified|unknown]
+# @option -r --results=verified <TYPE> Results type(s) [verified|unverified|unknown], comma-separated for multiple
 # @option -o --output <NAME> Base name for output files (auto-detected if not provided)
 # @flag -j --json-only Output only JSONL, skip CSV conversion
 # @flag -q --quiet Suppress progress output
@@ -42,7 +42,7 @@ ARGS:
   [TARGET]  Target file or directory to scan [default: .]
 
 OPTIONS:
-  -r, --results <TYPE>  Results type [verified|unverified|unknown] [default: verified]
+  -r, --results <TYPE>  Results type(s) [verified|unverified|unknown], comma-separated for multiple [default: verified]
   -o, --output <NAME>   Base name for output files (auto-detected if not provided)
   -j, --json-only       Output only JSONL, skip CSV conversion
   -q, --quiet           Suppress progress output
@@ -333,10 +333,16 @@ count_archive_files() {
 
 # Validate results type
 validate_results_type() {
-  case "$argc_results" in
-    verified|unverified|unknown) return 0 ;;
-    *) die "Invalid results type: $argc_results (valid: verified, unverified, unknown)" ;;
-  esac
+  local valid_types=("verified" "unverified" "unknown")
+  local IFS=','
+  local valid=true
+  
+  for result_type in $argc_results; do
+    if [[ ! " ${valid_types[*]} " =~ " ${result_type} " ]]; then
+      die "Invalid results type: $result_type (valid: verified, unverified, unknown)"
+      valid=false
+    fi
+  done
 }
 
 # Determine base name for output files
@@ -419,7 +425,7 @@ run_scan() {
   local jsonl_file="$1"
   
   log_verbose "Target: $argc_target"
-  log_verbose "Results type: $argc_results"
+  log_verbose "Results type(s): $argc_results"
   log_verbose "Output: $jsonl_file"
   
   local total_items item_type is_single_file=false
