@@ -334,15 +334,18 @@ count_archive_files() {
 # Validate results type
 validate_results_type() {
   local valid_types=("verified" "unverified" "unknown")
-  local IFS=','
-  local valid=true
-  
-  for result_type in $argc_results; do
+  local result_type
+  local input="${argc_results%$'\n'}"
+
+  while IFS= read -r -d',' result_type || [[ -n "$result_type" ]]; do
+    result_type="${result_type%$'\n'}"
+    result_type="${result_type## }"
+    result_type="${result_type%% }"
+    [[ -z "$result_type" ]] && continue
     if [[ ! " ${valid_types[*]} " =~ " ${result_type} " ]]; then
       die "Invalid results type: $result_type (valid: verified, unverified, unknown)"
-      valid=false
     fi
-  done
+  done <<< "$input"
 }
 
 # Determine base name for output files
