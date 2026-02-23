@@ -9,6 +9,306 @@
 # @flag -q --quiet Suppress progress output
 # @flag -v --verbose Enable verbose output
 
+# Setup colors
+setup_colors() {
+  if [[ "$argc_quiet" == 1 ]] || [[ -z "$TERM" ]] || [[ "$TERM" == "dumb" ]]; then
+    bold="" reset="" blue="" green="" yellow="" cyan="" red=""
+  else
+    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
+    yellow=$(tput setaf 3) cyan=$(tput setaf 6) red=$(tput setaf 1)
+  fi
+}
+
+log() { [[ -z "$argc_quiet" ]] && printf "%s\n" "$*" >&2; }
+log_verbose() { [[ -n "$argc_verbose" ]] && printf "${blue}::${reset} %s\n" "$*" >&2; }
+die() { printf "${red}Error:${reset} %s\n" "$*" >&2; exit 1; }
+
+# Check if file is an archive type
+is_archive() {
+  local file="$1"
+  case "${file,,}" in
+    *.zip|*.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.gz|*.bz2|*.xz|*.7z|*.rar) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Count files in archive
+count_archive_files() {
+  local file="$1"
+  case "${file,,}" in
+    *.zip) unzip -l "$file" 2>/dev/null | tail -1 | awk '{print $2}' ;;
+    *.tar) tar -tf "$file" 2>/dev/null | wc -l ;;
+    *.tar.gz|*.tgz) tar -tzf "$file" 2>/dev/null | wc -l ;;
+    *.tar.bz2|*.tbz2) tar -tjf "$file" 2>/dev/null | wc -l ;;
+    *.tar.xz|*.txz) tar -tJf "$file" 2>/dev/null | wc -l ;;
+    *.7z) 7z l "$file" 2>/dev/null | grep -c "^[0-9]" ;;
+    *) echo 1 ;;  # Fallback for unknown archive types
+  esac
+}
+
+# Validate results type
+validate_results_type() {
+  local valid_types=("verified" "unverified" "unknown")
+  local result_type
+  local input="${argc_results%$'\n'}"
+
+  while IFS= read -r -d',' result_type || [[ -n "$result_type" ]]; do
+    result_type="${result_type%$'\n'}"
+    result_type="${result_type## }"
+    result_type="${result_type%% }"
+    [[ -z "$result_type" ]] && continue
+    if [[ ! " ${valid_types[*]} " =~ " ${result_type} " ]]; then
+      die "Invalid results type: $result_type (valid: verified, unverified, unknown)"
+    fi
+  done <<< "$input"
+}
+
+# Determine base name for output files
+get_base_name() {
+  if [[ -n "$argc_output" ]]; then
+    echo "$argc_output"
+  elif [[ -f "$argc_target" ]]; then
+    local base
+    base=$(basename "$argc_target")
+    echo "${base%.*}"
+  elif [[ -d "$argc_target" ]]; then
+    basename "$argc_target"
+  else
+    echo "results"
+  fi
+}
+
+# Validate target exists and normalize path
+validate_target() {
+  [[ -e "$argc_target" ]] || die "Target does not exist: $argc_target"
+  # Resolve to absolute path to prevent trufflehog from misinterpreting
+  # paths starting with @ (treated as arguments file) or - (treated as flag)
+  argc_target="$(realpath "$argc_target")"
+}
+
+# Draw progress bar
+draw_progress() {
+  local current="$1" total="$2" label="$3" width=30
+  [[ $total -eq 0 ]] && total=1
+  [[ $current -gt $total ]] && current=$total
+
+  local percent=$((current * 100 / total))
+  local filled=$((current * width / total))
+  local empty=$((width - filled))
+  local bar=""
+
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=0; i<empty; i++)); do bar+="░"; done
+
+  printf "\r${cyan}[${green}%s${cyan}]${reset} %3d%% (%d/%d %s)" \
+    "$bar" "$percent" "$current" "$total" "$label" >&2
+}
+
+# Draw spinner with message
+draw_spinner() {
+  local frame="$1" label="$2"
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local spinner="${frames[$((frame % ${#frames[@]}))]}"
+  printf "\r${cyan}%s${reset} %s" "$spinner" "$label" >&2
+}
+
+# Draw final result for spinner mode
+draw_spinner_done() {
+  local chunks="$1"
+  printf "\r${green}✓${reset} Scanned %d chunks\n" "$chunks" >&2
+}
+
+# Estimate chunks for a single file (trufflehog uses ~12KB chunks)
+estimate_file_chunks() {
+  local file="$1"
+  local size
+  size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+  local chunks=$(( (size + 12000 - 1) / 12000 ))  # Round up
+  [[ $chunks -lt 1 ]] && chunks=1
+  echo "$chunks"
+}
+
+# Count total items for progress
+count_items() {
+  if [[ -f "$argc_target" ]]; then
+    if is_archive "$argc_target"; then
+      count_archive_files "$argc_target"
+    else
+      estimate_file_chunks "$argc_target"  # Estimate chunks based on file size
+    fi
+  else
+    find "$argc_target" -type f 2>/dev/null | wc -l
+  fi
+}
+
+# Run trufflehog scan with progress
+run_scan() {
+  local jsonl_file="$1"
+
+  log_verbose "Target: $argc_target"
+  log_verbose "Results type(s): $argc_results"
+  log_verbose "Output: $jsonl_file"
+
+  local total_items item_type is_single_file=false
+  total_items=$(count_items)
+
+  if [[ -f "$argc_target" ]] && ! is_archive "$argc_target"; then
+    is_single_file=true
+    item_type="chunks"
+  else
+    item_type="files"
+  fi
+
+  if [[ -z "$argc_quiet" ]]; then
+    > "$jsonl_file"
+
+    # Use named pipe to process stderr while capturing stdout to file
+    # Log levels: 0=info, 3=scanning file, 4=opened file (archives)
+    local fifo log_level
+    fifo=$(mktemp -u)
+    mkfifo "$fifo"
+
+    if [[ -f "$argc_target" ]]; then
+      if is_archive "$argc_target"; then
+        log_level=4  # Archives: "Opened file successfully" messages
+      else
+        log_level=0  # Single files: "finished scanning" message with chunks count
+      fi
+    else
+      log_level=3    # Directories: "scanning file" messages
+    fi
+
+    if [[ "$is_single_file" == true ]]; then
+      # Single file: use spinner since trufflehog doesn't provide incremental progress
+      local spinner_frame=0 actual_chunks=0
+
+      # Start spinner in background
+      {
+        while true; do
+          draw_spinner "$spinner_frame" "Scanning file..."
+          ((spinner_frame++))
+          sleep 0.1
+        done
+      } &
+      local spinner_pid=$!
+
+      # Capture stderr to extract chunk count
+      local stderr_file
+      stderr_file=$(mktemp)
+
+      trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level=0 \
+        > "$jsonl_file" 2>"$stderr_file"
+
+      # Stop spinner
+      kill "$spinner_pid" 2>/dev/null
+      wait "$spinner_pid" 2>/dev/null || true
+
+      # Extract chunk count from stderr
+      actual_chunks=$(grep '"finished scanning"' "$stderr_file" | jq -r '.chunks // 0' 2>/dev/null)
+      rm -f "$stderr_file"
+
+      [[ -z "$actual_chunks" || "$actual_chunks" == "0" ]] && actual_chunks=1
+      draw_spinner_done "$actual_chunks"
+    else
+      # Directory/archive: use progress bar with incremental updates
+      log "${cyan}Scanning...${reset}"
+      draw_progress 0 "$total_items" "$item_type"
+
+      # Process stderr in background for progress updates
+      {
+        local processed=0
+        declare -A seen_files
+        while IFS= read -r line; do
+          # For archives: track "Opened file successfully" messages (log-level 4)
+          if [[ "$line" == *'"msg":"Opened file successfully"'* ]]; then
+            local filename
+            filename=$(echo "$line" | jq -r '.filename // empty' 2>/dev/null)
+            if [[ -n "$filename" && -z "${seen_files[$filename]:-}" ]]; then
+              seen_files["$filename"]=1
+              ((processed++))
+              draw_progress "$processed" "$total_items" "$item_type"
+            fi
+          # For directories: track "scanning file" messages (log-level 3)
+          elif [[ "$line" == *'"msg":"scanning file"'* ]]; then
+            local scanned_path
+            scanned_path=$(echo "$line" | jq -r '.path // empty' 2>/dev/null)
+            if [[ -n "$scanned_path" && -z "${seen_files[$scanned_path]:-}" ]]; then
+              seen_files["$scanned_path"]=1
+              ((processed++))
+              draw_progress "$processed" "$total_items" "$item_type"
+            fi
+          fi
+        done < "$fifo"
+      } &
+      local progress_pid=$!
+
+      # Run trufflehog: stdout to jsonl file, stderr to fifo for progress
+      trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level="$log_level" \
+        > "$jsonl_file" 2>"$fifo"
+
+      wait "$progress_pid" 2>/dev/null || true
+      rm -f "$fifo"
+
+      # Show 100% at end
+      draw_progress "$total_items" "$total_items" "$item_type"
+      printf "\n" >&2
+    fi
+  else
+    if ! trufflehog filesystem "$argc_target" --results "$argc_results" -j 2>/dev/null > "$jsonl_file"; then
+      die "Trufflehog scan failed"
+    fi
+  fi
+
+  local count
+  count=$(wc -l < "$jsonl_file")
+  log "${green}Found ${bold}${count}${reset}${green} results${reset}"
+}
+
+# Convert JSONL to CSV
+convert_to_csv() {
+  local jsonl_file="$1"
+  local csv_file="$2"
+
+  log_verbose "Converting to CSV: $csv_file"
+
+  # Print header once, then process each line
+  {
+    echo '"Verified","DetectorName","Raw","RawV2","ExtraData"'
+    jq -r '[
+      .Verified,
+      .DetectorName,
+      (.Raw | gsub("\n"; " ")),
+      (.RawV2 // "" | gsub("\n"; " ")),
+      (.ExtraData | if . == null then "" else (tostring | gsub("\n"; " ")) end)
+    ] | @csv' "$jsonl_file"
+  } | awk '!seen[$0]++' > "$csv_file"
+
+  if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+    die "CSV conversion failed"
+  fi
+}
+
+# Main execution
+main() {
+  setup_colors
+  validate_results_type
+  validate_target
+
+  local base_name jsonl_file csv_file
+  base_name=$(get_base_name)
+  jsonl_file="${base_name}.jsonl"
+  csv_file="${base_name}.csv"
+
+  run_scan "$jsonl_file"
+
+  if [[ -z "$argc_json_only" ]]; then
+    convert_to_csv "$jsonl_file" "$csv_file"
+    log "\n${green}Done:${reset} ${cyan}$jsonl_file${reset}, ${cyan}$csv_file${reset}"
+  else
+    log "\n${green}Done:${reset} ${cyan}$jsonl_file${reset}"
+  fi
+}
+
 # ARGC-BUILD {
 # This block was generated by argc (https://github.com/sigoden/argc).
 # Modifying it manually is not recommended
@@ -292,302 +592,3 @@ _argc_die() {
 _argc_run "$@"
 
 # ARGC-BUILD }
-
-# Setup colors
-setup_colors() {
-  if [[ "$argc_quiet" == 1 ]] || [[ -z "$TERM" ]] || [[ "$TERM" == "dumb" ]]; then
-    bold="" reset="" blue="" green="" yellow="" cyan="" red=""
-  else
-    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
-    yellow=$(tput setaf 3) cyan=$(tput setaf 6) red=$(tput setaf 1)
-  fi
-}
-setup_colors
-
-log() { [[ -z "$argc_quiet" ]] && printf "%s\n" "$*" >&2; }
-log_verbose() { [[ -n "$argc_verbose" ]] && printf "${blue}::${reset} %s\n" "$*" >&2; }
-die() { printf "${red}Error:${reset} %s\n" "$*" >&2; exit 1; }
-
-# Check if file is an archive type
-is_archive() {
-  local file="$1"
-  case "${file,,}" in
-    *.zip|*.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.gz|*.bz2|*.xz|*.7z|*.rar) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# Count files in archive
-count_archive_files() {
-  local file="$1"
-  case "${file,,}" in
-    *.zip) unzip -l "$file" 2>/dev/null | tail -1 | awk '{print $2}' ;;
-    *.tar) tar -tf "$file" 2>/dev/null | wc -l ;;
-    *.tar.gz|*.tgz) tar -tzf "$file" 2>/dev/null | wc -l ;;
-    *.tar.bz2|*.tbz2) tar -tjf "$file" 2>/dev/null | wc -l ;;
-    *.tar.xz|*.txz) tar -tJf "$file" 2>/dev/null | wc -l ;;
-    *.7z) 7z l "$file" 2>/dev/null | grep -c "^[0-9]" ;;
-    *) echo 1 ;;  # Fallback for unknown archive types
-  esac
-}
-
-# Validate results type
-validate_results_type() {
-  local valid_types=("verified" "unverified" "unknown")
-  local result_type
-  local input="${argc_results%$'\n'}"
-
-  while IFS= read -r -d',' result_type || [[ -n "$result_type" ]]; do
-    result_type="${result_type%$'\n'}"
-    result_type="${result_type## }"
-    result_type="${result_type%% }"
-    [[ -z "$result_type" ]] && continue
-    if [[ ! " ${valid_types[*]} " =~ " ${result_type} " ]]; then
-      die "Invalid results type: $result_type (valid: verified, unverified, unknown)"
-    fi
-  done <<< "$input"
-}
-
-# Determine base name for output files
-get_base_name() {
-  if [[ -n "$argc_output" ]]; then
-    echo "$argc_output"
-  elif [[ -f "$argc_target" ]]; then
-    local base
-    base=$(basename "$argc_target")
-    echo "${base%.*}"
-  elif [[ -d "$argc_target" ]]; then
-    basename "$argc_target"
-  else
-    echo "results"
-  fi
-}
-
-# Validate target exists
-validate_target() {
-  [[ -e "$argc_target" ]] || die "Target does not exist: $argc_target"
-}
-
-# Draw progress bar
-draw_progress() {
-  local current="$1" total="$2" label="$3" width=30
-  [[ $total -eq 0 ]] && total=1
-  [[ $current -gt $total ]] && current=$total
-  
-  local percent=$((current * 100 / total))
-  local filled=$((current * width / total))
-  local empty=$((width - filled))
-  local bar=""
-  
-  for ((i=0; i<filled; i++)); do bar+="█"; done
-  for ((i=0; i<empty; i++)); do bar+="░"; done
-  
-  printf "\r${cyan}[${green}%s${cyan}]${reset} %3d%% (%d/%d %s)" \
-    "$bar" "$percent" "$current" "$total" "$label" >&2
-}
-
-# Draw spinner with message
-draw_spinner() {
-  local frame="$1" label="$2"
-  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-  local spinner="${frames[$((frame % ${#frames[@]}))]}"
-  printf "\r${cyan}%s${reset} %s" "$spinner" "$label" >&2
-}
-
-# Draw final result for spinner mode
-draw_spinner_done() {
-  local chunks="$1"
-  printf "\r${green}✓${reset} Scanned %d chunks\n" "$chunks" >&2
-}
-
-# Estimate chunks for a single file (trufflehog uses ~12KB chunks)
-estimate_file_chunks() {
-  local file="$1"
-  local size
-  size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
-  local chunks=$(( (size + 12000 - 1) / 12000 ))  # Round up
-  [[ $chunks -lt 1 ]] && chunks=1
-  echo "$chunks"
-}
-
-# Count total items for progress
-count_items() {
-  if [[ -f "$argc_target" ]]; then
-    if is_archive "$argc_target"; then
-      count_archive_files "$argc_target"
-    else
-      estimate_file_chunks "$argc_target"  # Estimate chunks based on file size
-    fi
-  else
-    find "$argc_target" -type f 2>/dev/null | wc -l
-  fi
-}
-
-# Run trufflehog scan with progress
-run_scan() {
-  local jsonl_file="$1"
-  
-  log_verbose "Target: $argc_target"
-  log_verbose "Results type(s): $argc_results"
-  log_verbose "Output: $jsonl_file"
-  
-  local total_items item_type is_single_file=false
-  total_items=$(count_items)
-  
-  if [[ -f "$argc_target" ]] && ! is_archive "$argc_target"; then
-    is_single_file=true
-    item_type="chunks"
-  else
-    item_type="files"
-  fi
-  
-  if [[ -z "$argc_quiet" ]]; then
-    > "$jsonl_file"
-    
-    # Use named pipe to process stderr while capturing stdout to file
-    # Log levels: 0=info, 3=scanning file, 4=opened file (archives)
-    local fifo log_level
-    fifo=$(mktemp -u)
-    mkfifo "$fifo"
-    
-    if [[ -f "$argc_target" ]]; then
-      if is_archive "$argc_target"; then
-        log_level=4  # Archives: "Opened file successfully" messages
-      else
-        log_level=0  # Single files: "finished scanning" message with chunks count
-      fi
-    else
-      log_level=3    # Directories: "scanning file" messages
-    fi
-    
-    if [[ "$is_single_file" == true ]]; then
-      # Single file: use spinner since trufflehog doesn't provide incremental progress
-      local spinner_frame=0 actual_chunks=0
-      
-      # Start spinner in background
-      {
-        while true; do
-          draw_spinner "$spinner_frame" "Scanning file..."
-          ((spinner_frame++))
-          sleep 0.1
-        done
-      } &
-      local spinner_pid=$!
-      
-      # Capture stderr to extract chunk count
-      local stderr_file
-      stderr_file=$(mktemp)
-      
-      trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level=0 \
-        > "$jsonl_file" 2>"$stderr_file"
-      
-      # Stop spinner
-      kill "$spinner_pid" 2>/dev/null
-      wait "$spinner_pid" 2>/dev/null || true
-      
-      # Extract chunk count from stderr
-      actual_chunks=$(grep '"finished scanning"' "$stderr_file" | jq -r '.chunks // 0' 2>/dev/null)
-      rm -f "$stderr_file"
-      
-      [[ -z "$actual_chunks" || "$actual_chunks" == "0" ]] && actual_chunks=1
-      draw_spinner_done "$actual_chunks"
-    else
-      # Directory/archive: use progress bar with incremental updates
-      log "${cyan}Scanning...${reset}"
-      draw_progress 0 "$total_items" "$item_type"
-      
-      # Process stderr in background for progress updates
-      {
-        local processed=0
-        declare -A seen_files
-        while IFS= read -r line; do
-          # For archives: track "Opened file successfully" messages (log-level 4)
-          if [[ "$line" == *'"msg":"Opened file successfully"'* ]]; then
-            local filename
-            filename=$(echo "$line" | jq -r '.filename // empty' 2>/dev/null)
-            if [[ -n "$filename" && -z "${seen_files[$filename]:-}" ]]; then
-              seen_files["$filename"]=1
-              ((processed++))
-              draw_progress "$processed" "$total_items" "$item_type"
-            fi
-          # For directories: track "scanning file" messages (log-level 3)
-          elif [[ "$line" == *'"msg":"scanning file"'* ]]; then
-            local scanned_path
-            scanned_path=$(echo "$line" | jq -r '.path // empty' 2>/dev/null)
-            if [[ -n "$scanned_path" && -z "${seen_files[$scanned_path]:-}" ]]; then
-              seen_files["$scanned_path"]=1
-              ((processed++))
-              draw_progress "$processed" "$total_items" "$item_type"
-            fi
-          fi
-        done < "$fifo"
-      } &
-      local progress_pid=$!
-      
-      # Run trufflehog: stdout to jsonl file, stderr to fifo for progress
-      trufflehog filesystem "$argc_target" --results "$argc_results" -j --log-level="$log_level" \
-        > "$jsonl_file" 2>"$fifo"
-      
-      wait "$progress_pid" 2>/dev/null || true
-      rm -f "$fifo"
-      
-      # Show 100% at end
-      draw_progress "$total_items" "$total_items" "$item_type"
-      printf "\n" >&2
-    fi
-  else
-    if ! trufflehog filesystem "$argc_target" --results "$argc_results" -j 2>/dev/null > "$jsonl_file"; then
-      die "Trufflehog scan failed"
-    fi
-  fi
-  
-  local count
-  count=$(wc -l < "$jsonl_file")
-  log "${green}Found ${bold}${count}${reset}${green} results${reset}"
-}
-
-# Convert JSONL to CSV
-convert_to_csv() {
-  local jsonl_file="$1"
-  local csv_file="$2"
-  
-  log_verbose "Converting to CSV: $csv_file"
-  
-  # Print header once, then process each line
-  {
-    echo '"Verified","DetectorName","Raw","RawV2","ExtraData"'
-    jq -r '[
-      .Verified,
-      .DetectorName,
-      (.Raw | gsub("\n"; " ")),
-      (.RawV2 // "" | gsub("\n"; " ")),
-      (.ExtraData | if . == null then "" else (tostring | gsub("\n"; " ")) end)
-    ] | @csv' "$jsonl_file"
-  } | awk '!seen[$0]++' > "$csv_file"
-  
-  if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
-    die "CSV conversion failed"
-  fi
-}
-
-# Main execution
-main() {
-  validate_results_type
-  validate_target
-  
-  local base_name jsonl_file csv_file
-  base_name=$(get_base_name)
-  jsonl_file="${base_name}.jsonl"
-  csv_file="${base_name}.csv"
-  
-  run_scan "$jsonl_file"
-  
-  if [[ -z "$argc_json_only" ]]; then
-    convert_to_csv "$jsonl_file" "$csv_file"
-    log "\n${green}Done:${reset} ${cyan}$jsonl_file${reset}, ${cyan}$csv_file${reset}"
-  else
-    log "\n${green}Done:${reset} ${cyan}$jsonl_file${reset}"
-  fi
-}
-
-main
