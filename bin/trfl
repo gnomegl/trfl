@@ -162,22 +162,6 @@ run_scan() {
   if [[ -z "$argc_quiet" ]]; then
     > "$jsonl_file"
 
-    # Use named pipe to process stderr while capturing stdout to file
-    # Log levels: 0=info, 3=scanning file, 4=opened file (archives)
-    local fifo log_level
-    fifo=$(mktemp -u)
-    mkfifo "$fifo"
-
-    if [[ -f "$argc_target" ]]; then
-      if is_archive "$argc_target"; then
-        log_level=4  # Archives: "Opened file successfully" messages
-      else
-        log_level=0  # Single files: "finished scanning" message with chunks count
-      fi
-    else
-      log_level=3    # Directories: "scanning file" messages
-    fi
-
     if [[ "$is_single_file" == true ]]; then
       # Single file: use spinner since trufflehog doesn't provide incremental progress
       local spinner_frame=0 actual_chunks=0
@@ -211,6 +195,17 @@ run_scan() {
       draw_spinner_done "$actual_chunks"
     else
       # Directory/archive: use progress bar with incremental updates
+      # Use named pipe so we can parse stderr for progress while capturing stdout
+      local fifo log_level
+      fifo=$(mktemp -u)
+      mkfifo "$fifo"
+
+      if [[ -f "$argc_target" ]] && is_archive "$argc_target"; then
+        log_level=3  # Archives: "scanning file" messages for each entry
+      else
+        log_level=3  # Directories: "scanning file" messages
+      fi
+
       log "${cyan}Scanning...${reset}"
       draw_progress 0 "$total_items" "$item_type"
 
@@ -219,21 +214,14 @@ run_scan() {
         local processed=0
         declare -A seen_files
         while IFS= read -r line; do
-          # For archives: track "Opened file successfully" messages (log-level 4)
-          if [[ "$line" == *'"msg":"Opened file successfully"'* ]]; then
-            local filename
-            filename=$(echo "$line" | jq -r '.filename // empty' 2>/dev/null)
-            if [[ -n "$filename" && -z "${seen_files[$filename]:-}" ]]; then
-              seen_files["$filename"]=1
-              ((processed++))
-              draw_progress "$processed" "$total_items" "$item_type"
-            fi
-          # For directories: track "scanning file" messages (log-level 3)
-          elif [[ "$line" == *'"msg":"scanning file"'* ]]; then
-            local scanned_path
-            scanned_path=$(echo "$line" | jq -r '.path // empty' 2>/dev/null)
-            if [[ -n "$scanned_path" && -z "${seen_files[$scanned_path]:-}" ]]; then
-              seen_files["$scanned_path"]=1
+          # Track "scanning file" messages (works for both dirs and archives)
+          if [[ "$line" == *'"msg":"scanning file"'* ]]; then
+            local val
+            # Extract path value with pure bash: find "path":" then grab until next "
+            val="${line#*'"path":"'}"
+            val="${val%%\"*}"
+            if [[ -n "$val" && "$val" != "$line" && -z "${seen_files[$val]:-}" ]]; then
+              seen_files["$val"]=1
               ((processed++))
               draw_progress "$processed" "$total_items" "$item_type"
             fi
@@ -259,9 +247,22 @@ run_scan() {
     fi
   fi
 
-  local count
-  count=$(wc -l < "$jsonl_file")
-  log "${green}Found ${bold}${count}${reset}${green} results${reset}"
+  # Deduplicate JSONL results
+  local raw_count dedup_count
+  raw_count=$(wc -l < "$jsonl_file")
+  if [[ $raw_count -gt 0 ]]; then
+    local tmp_dedup
+    tmp_dedup=$(mktemp)
+    jq -sc 'unique | .[]' "$jsonl_file" > "$tmp_dedup"
+    mv "$tmp_dedup" "$jsonl_file"
+  fi
+  dedup_count=$(wc -l < "$jsonl_file")
+
+  if [[ $raw_count -ne $dedup_count ]]; then
+    log "${green}Found ${bold}${dedup_count}${reset}${green} results${reset} (${raw_count} raw, removed $((raw_count - dedup_count)) dupes)"
+  else
+    log "${green}Found ${bold}${dedup_count}${reset}${green} results${reset}"
+  fi
 }
 
 # Convert JSONL to CSV
@@ -281,7 +282,7 @@ convert_to_csv() {
       (.RawV2 // "" | gsub("\n"; " ")),
       (.ExtraData | if . == null then "" else (tostring | gsub("\n"; " ")) end)
     ] | @csv' "$jsonl_file"
-  } | awk '!seen[$0]++' > "$csv_file"
+  } > "$csv_file"
 
   if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
     die "CSV conversion failed"
