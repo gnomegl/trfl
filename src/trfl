@@ -368,7 +368,7 @@ write_split_files() {
   local detectors
   detectors=$(echo "$summary_json" | jq -r '.[].detector')
 
-  # Split results into per-detector .txt files
+  # Split results into per-detector .txt files (append + dedup)
   while IFS= read -r detector; do
     [[ -z "$detector" ]] && continue
 
@@ -376,46 +376,87 @@ write_split_files() {
     safe_name=$(echo "$detector" | tr ' /' '_-')
     outfile="$outdir/${safe_name}.txt"
 
-    {
-      echo "# ${detector} — Secrets Report"
-      echo "# Generated: $(date -Iseconds)"
-      echo "# Source: $input"
-      echo ""
+    # Generate new entries to a temp file
+    local tmp_new
+    tmp_new=$(mktemp)
+    if [[ "$full_raw" == true ]]; then
+      jq -r --arg det "$detector" '
+        select(.DetectorName == $det) |
+        "## [\(if .Verified then "VERIFIED" else "unverified" end)] \(.SourceMetadata.Data.Filesystem.file // "unknown"):\(.SourceMetadata.Data.Filesystem.line // "?")\n" +
+        "Raw: \(.Raw | gsub("\n"; "\n     "))\n" +
+        if (.RawV2 // "") != "" then "RawV2: \(.RawV2 | gsub("\n"; "\n       "))\n" else "" end +
+        if (.ExtraData // {} | length) > 0 then "Extra: \(.ExtraData | tostring)\n" else "" end +
+        "---"
+      ' "$input" > "$tmp_new"
+    else
+      jq -r --arg det "$detector" '
+        select(.DetectorName == $det) |
+        "## [\(if .Verified then "VERIFIED" else "unverified" end)] \(.SourceMetadata.Data.Filesystem.file // "unknown"):\(.SourceMetadata.Data.Filesystem.line // "?")\n" +
+        "Redacted: \(.Redacted | if . == "" or . == null then "(empty)" else gsub("\n"; "\n          ") end)\n" +
+        if (.ExtraData // {} | length) > 0 then "Extra: \(.ExtraData | tostring)\n" else "" end +
+        "---"
+      ' "$input" > "$tmp_new"
+    fi
 
-      if [[ "$full_raw" == true ]]; then
-        jq -r --arg det "$detector" '
-          select(.DetectorName == $det) |
-          "## [\(if .Verified then "VERIFIED" else "unverified" end)] \(.SourceMetadata.Data.Filesystem.file // "unknown"):\(.SourceMetadata.Data.Filesystem.line // "?")\n" +
-          "Raw: \(.Raw | gsub("\n"; "\n     "))\n" +
-          if (.RawV2 // "") != "" then "RawV2: \(.RawV2 | gsub("\n"; "\n       "))\n" else "" end +
-          if (.ExtraData // {} | length) > 0 then "Extra: \(.ExtraData | tostring)\n" else "" end +
-          "---"
-        ' "$input"
-      else
-        jq -r --arg det "$detector" '
-          select(.DetectorName == $det) |
-          "## [\(if .Verified then "VERIFIED" else "unverified" end)] \(.SourceMetadata.Data.Filesystem.file // "unknown"):\(.SourceMetadata.Data.Filesystem.line // "?")\n" +
-          "Redacted: \(.Redacted | if . == "" or . == null then "(empty)" else gsub("\n"; "\n          ") end)\n" +
-          if (.ExtraData // {} | length) > 0 then "Extra: \(.ExtraData | tostring)\n" else "" end +
-          "---"
-        ' "$input"
-      fi
-    } > "$outfile"
+    local new_count merged_label
+    if [[ -f "$outfile" ]]; then
+      # Merge: extract existing entry blocks, combine with new, dedup
+      local tmp_existing tmp_merged
+      tmp_existing=$(mktemp)
+      tmp_merged=$(mktemp)
+      # Extract just the entry blocks from existing file (skip # header lines)
+      awk '/^## \[/{found=1} found{print}' "$outfile" > "$tmp_existing"
+      # Combine existing + new, dedup by whole entry block (## ... through ---)
+      cat "$tmp_existing" "$tmp_new" | \
+        awk '/^## \[/{if(block) { if(!seen[block]++) printf "%s", block } block=""} {block=block $0 "\n"} END{if(block && !seen[block]++) printf "%s", block}' > "$tmp_merged"
+      # Rewrite file with updated header + deduped entries
+      {
+        echo "# ${detector} — Secrets Report"
+        echo "# Updated: $(date -Iseconds)"
+        echo "# Source: $input"
+        echo ""
+        cat "$tmp_merged"
+      } > "$outfile"
+      new_count=$(grep -c '^## \[' "$tmp_merged" || true)
+      merged_label="merged"
+      rm -f "$tmp_existing" "$tmp_merged"
+    else
+      # Fresh file: write header + entries
+      {
+        echo "# ${detector} — Secrets Report"
+        echo "# Generated: $(date -Iseconds)"
+        echo "# Source: $input"
+        echo ""
+        cat "$tmp_new"
+      } > "$outfile"
+      new_count=$(grep -c '^## \[' "$tmp_new" || true)
+      merged_label="new"
+    fi
+    rm -f "$tmp_new"
 
-    local count
-    count=$(echo "$summary_json" | jq -r --arg det "$detector" '.[] | select(.detector == $det) | .count')
-    printf "  ${green}✓${reset} %-25s → %s (%s results)\n" "$detector" "$outfile" "$count" >&2
+    printf "  ${green}✓${reset} %-25s → %s (%s entries, %s)\n" "$detector" "$outfile" "$new_count" "$merged_label" >&2
   done <<< "$detectors"
 
-  # Write per-detector JSONL splits
+  # Write per-detector JSONL splits (append + dedup)
   local jsonl_dir="$outdir/jsonl"
   mkdir -p "$jsonl_dir"
 
   while IFS= read -r detector; do
     [[ -z "$detector" ]] && continue
-    local safe_name
+    local safe_name jsonl_out
     safe_name=$(echo "$detector" | tr ' /' '_-')
-    jq -c --arg det "$detector" 'select(.DetectorName == $det)' "$input" > "$jsonl_dir/${safe_name}.jsonl"
+    jsonl_out="$jsonl_dir/${safe_name}.jsonl"
+
+    if [[ -f "$jsonl_out" ]] && [[ -s "$jsonl_out" ]]; then
+      # Merge existing + new, dedup
+      local tmp_merged
+      tmp_merged=$(mktemp)
+      { cat "$jsonl_out"; jq -c --arg det "$detector" 'select(.DetectorName == $det)' "$input"; } | \
+        jq -sc 'unique | .[]' > "$tmp_merged"
+      mv "$tmp_merged" "$jsonl_out"
+    else
+      jq -c --arg det "$detector" 'select(.DetectorName == $det)' "$input" > "$jsonl_out"
+    fi
   done <<< "$detectors"
 
   # Final summary
