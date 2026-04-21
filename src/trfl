@@ -511,4 +511,9 @@ main() {
   fi
 }
 
+# Show help when invoked with no arguments
+if [[ $# -eq 0 ]]; then
+  set -- --help
+fi
+
 eval "$(argc --argc-eval "$0" "$@")"
