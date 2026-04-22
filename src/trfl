@@ -338,7 +338,7 @@ print_summary_table() {
 
 # Write split files: per-detector .txt, summary.txt, and jsonl/
 write_split_files() {
-  local input="$1" outdir="$2" summary_json="$3" full_raw="$4"
+  local input="$1" outdir="$2" summary_json="$3"
 
   log ":: Exporting to ${cyan}${outdir}/${reset}"
   mkdir -p "$outdir"
@@ -368,7 +368,7 @@ write_split_files() {
   local detectors
   detectors=$(echo "$summary_json" | jq -r '.[].detector')
 
-  # Split results into per-detector .txt files (append + dedup)
+  # Split results into per-detector .txt files (one secret per line, deduped)
   while IFS= read -r detector; do
     [[ -z "$detector" ]] && continue
 
@@ -376,60 +376,27 @@ write_split_files() {
     safe_name=$(echo "$detector" | tr ' /' '_-')
     outfile="$outdir/${safe_name}.txt"
 
-    # Generate new entries to a temp file
+    # Generate new entries: each line is RawV2 if non-empty, else Raw
     local tmp_new
     tmp_new=$(mktemp)
-    if [[ "$full_raw" == true ]]; then
-      jq -r --arg det "$detector" '
-        select(.DetectorName == $det) |
-        "## [\(if .Verified then "VERIFIED" else "unverified" end)] \(.SourceMetadata.Data.Filesystem.file // "unknown"):\(.SourceMetadata.Data.Filesystem.line // "?")\n" +
-        "Raw: \(.Raw | gsub("\n"; "\n     "))\n" +
-        if (.RawV2 // "") != "" then "RawV2: \(.RawV2 | gsub("\n"; "\n       "))\n" else "" end +
-        if (.ExtraData // {} | length) > 0 then "Extra: \(.ExtraData | tostring)\n" else "" end +
-        "---"
-      ' "$input" > "$tmp_new"
-    else
-      jq -r --arg det "$detector" '
-        select(.DetectorName == $det) |
-        "## [\(if .Verified then "VERIFIED" else "unverified" end)] \(.SourceMetadata.Data.Filesystem.file // "unknown"):\(.SourceMetadata.Data.Filesystem.line // "?")\n" +
-        "Redacted: \(.Redacted | if . == "" or . == null then "(empty)" else gsub("\n"; "\n          ") end)\n" +
-        if (.ExtraData // {} | length) > 0 then "Extra: \(.ExtraData | tostring)\n" else "" end +
-        "---"
-      ' "$input" > "$tmp_new"
-    fi
+    jq -r --arg det "$detector" '
+      select(.DetectorName == $det) |
+      if (.RawV2 // "") != "" then .RawV2 else .Raw end |
+      gsub("\n"; " ") | gsub("^\\s+|\\s+$"; "")
+    ' "$input" | grep -v '^$' > "$tmp_new"
 
     local new_count merged_label
     if [[ -f "$outfile" ]]; then
-      # Merge: extract existing entry blocks, combine with new, dedup
-      local tmp_existing tmp_merged
-      tmp_existing=$(mktemp)
+      # Merge existing + new, sort | uniq
+      local tmp_merged
       tmp_merged=$(mktemp)
-      # Extract just the entry blocks from existing file (skip # header lines)
-      awk '/^## \[/{found=1} found{print}' "$outfile" > "$tmp_existing"
-      # Combine existing + new, dedup by whole entry block (## ... through ---)
-      cat "$tmp_existing" "$tmp_new" | \
-        awk '/^## \[/{if(block) { if(!seen[block]++) printf "%s", block } block=""} {block=block $0 "\n"} END{if(block && !seen[block]++) printf "%s", block}' > "$tmp_merged"
-      # Rewrite file with updated header + deduped entries
-      {
-        echo "# ${detector} — Secrets Report"
-        echo "# Updated: $(date -Iseconds)"
-        echo "# Source: $input"
-        echo ""
-        cat "$tmp_merged"
-      } > "$outfile"
-      new_count=$(grep -c '^## \[' "$tmp_merged" || true)
+      cat "$outfile" "$tmp_new" | sort -u > "$tmp_merged"
+      mv "$tmp_merged" "$outfile"
+      new_count=$(wc -l < "$outfile")
       merged_label="merged"
-      rm -f "$tmp_existing" "$tmp_merged"
     else
-      # Fresh file: write header + entries
-      {
-        echo "# ${detector} — Secrets Report"
-        echo "# Generated: $(date -Iseconds)"
-        echo "# Source: $input"
-        echo ""
-        cat "$tmp_new"
-      } > "$outfile"
-      new_count=$(grep -c '^## \[' "$tmp_new" || true)
+      sort -u "$tmp_new" > "$outfile"
+      new_count=$(wc -l < "$outfile")
       merged_label="new"
     fi
     rm -f "$tmp_new"
@@ -469,7 +436,7 @@ write_split_files() {
 
 # Core split logic — used by both `split` subcommand and `--split` flag
 do_split() {
-  local input="$1" outdir="$2" summary_only="$3" full_raw="$4"
+  local input="$1" outdir="$2" summary_only="$3"
 
   validate_jsonl "$input"
 
@@ -497,7 +464,7 @@ do_split() {
     outdir="${input_dir}/${input_stem}_secrets"
   fi
 
-  write_split_files "$input" "$outdir" "$summary_json" "$full_raw"
+  write_split_files "$input" "$outdir" "$summary_json"
 }
 
 # ─── Subcommand: split ───────────────────────────────────────────────────────
@@ -506,14 +473,13 @@ do_split() {
 # @arg input! Trufflehog JSONL file to split
 # @option -o --output <DIR> Output directory (default: <basename>_secrets/)
 # @flag -s --summary Print summary only, don't write split files
-# @flag -f --full Include full raw secrets (default: redacted)
 # @flag -q --quiet Suppress progress output
 split() {
   _quiet="${argc_quiet:-}"
   _verbose=""
   setup_colors "$_quiet"
 
-  do_split "$argc_input" "${argc_output:-}" "${argc_summary:+true}" "${argc_full:+true}"
+  do_split "$argc_input" "${argc_output:-}" "${argc_summary:+true}"
 }
 
 # ─── Default command (scan) ───────────────────────────────────────────────────
@@ -547,7 +513,7 @@ main() {
     dedup_count=$(wc -l < "$jsonl_file")
     if [[ "$dedup_count" -gt 0 ]]; then
       echo "" >&2
-      do_split "$jsonl_file" "" false false
+      do_split "$jsonl_file" "" false
     fi
   fi
 }
