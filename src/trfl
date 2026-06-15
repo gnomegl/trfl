@@ -5,6 +5,7 @@
 # @arg target=. Target file or directory to scan
 # @option -r --results=verified <TYPE> Results type(s) [verified|unverified|unknown], comma-separated for multiple
 # @option -o --output <NAME> Base name for output files (auto-detected if not provided)
+# @option -d --include-detectors <DETECTORS> Only run specific detectors (comma-separated), passed directly to trufflehog --include-detectors
 # @flag -j --json-only Output only JSONL, skip CSV conversion
 # @flag -s --split Also split results into per-detector files after scanning
 # @flag -q --quiet Suppress progress output
@@ -148,6 +149,7 @@ run_scan() {
 
   log_verbose "Target: $target"
   log_verbose "Results type(s): $results"
+  [[ -n "${4:-}" ]] && log_verbose "Include detectors: $4"
   log_verbose "Output: $jsonl_file"
 
   local total_items item_type is_single_file=false
@@ -178,7 +180,11 @@ run_scan() {
       local stderr_file
       stderr_file=$(mktemp)
 
+      local th_include=""
+      [[ -n "${4:-}" ]] && th_include="--include-detectors=$4"
+
       trufflehog filesystem "$target" --results "$results" -j --log-level=0 \
+        ${th_include:+$th_include} \
         > "$jsonl_file" 2>"$stderr_file"
 
       kill "$spinner_pid" 2>/dev/null
@@ -221,7 +227,11 @@ run_scan() {
       } &
       local progress_pid=$!
 
+      local th_include=""
+      [[ -n "${4:-}" ]] && th_include="--include-detectors=$4"
+
       trufflehog filesystem "$target" --results "$results" -j --log-level="$log_level" \
+        ${th_include:+$th_include} \
         > "$jsonl_file" 2>"$fifo"
 
       wait "$progress_pid" 2>/dev/null || true
@@ -231,7 +241,10 @@ run_scan() {
       printf "\n" >&2
     fi
   else
-    if ! trufflehog filesystem "$target" --results "$results" -j 2>/dev/null > "$jsonl_file"; then
+    local th_include=""
+    [[ -n "${4:-}" ]] && th_include="--include-detectors=$4"
+
+    if ! trufflehog filesystem "$target" --results "$results" -j ${th_include:+$th_include} 2>/dev/null > "$jsonl_file"; then
       die "Trufflehog scan failed"
     fi
   fi
@@ -498,7 +511,7 @@ main() {
   jsonl_file="${base_name}.jsonl"
   csv_file="${base_name}.csv"
 
-  run_scan "$jsonl_file" "$target" "$argc_results"
+  run_scan "$jsonl_file" "$target" "$argc_results" "${argc_include_detectors:-}"
 
   if [[ -z "${argc_json_only:-}" ]]; then
     convert_to_csv "$jsonl_file" "$csv_file"
