@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 
-# @describe Scan target with trufflehog and convert results to CSV
-# @meta require-tools trufflehog,jq
+# @describe Scan target with trufflehog/thog and convert results to CSV
+# @meta require-tools jq
 # @arg target=. Target file or directory to scan
 # @option -r --results=verified <TYPE> Results type(s) [verified|unverified|unknown], comma-separated for multiple
 # @option -o --output <NAME> Base name for output files (auto-detected if not provided)
-# @option -d --include-detectors <DETECTORS> Only run specific detectors (comma-separated), passed directly to trufflehog --include-detectors
+# @option -d --include-detectors <DETECTORS> Only run specific detectors (comma-separated), passed directly to the scanner --include-detectors
+# @option -e --engine=auto <ENGINE> Scanner binary: auto (prefer thog), thog (stealth fork), or trufflehog (stock). Env: TRFL_ENGINE
 # @flag -j --json-only Output only JSONL, skip CSV conversion
 # @flag -s --split Also split results into per-detector files after scanning
 # @flag -q --quiet Suppress progress output
 # @flag -v --verbose Enable verbose output
+# @flag --no-leveldb Skip LevelDB strings pre-scan (strings extraction from .ldb/.sst/.log before scanning dirs)
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -28,7 +30,53 @@ log() { [[ -z "$_quiet" ]] && printf "%s\n" "$*" >&2; }
 log_verbose() { [[ -n "$_verbose" ]] && printf "${blue}::${reset} %s\n" "$*" >&2; }
 die() { printf "${red}Error:${reset} %s\n" "$*" >&2; exit 1; }
 
+# Resolved scanner binary (thog or trufflehog). Set by resolve_engine().
+_engine=""
+
 # ─── Shared helpers ───────────────────────────────────────────────────────────
+
+# resolve_engine <auto|thog|trufflehog>
+# Picks the scanner binary. Order for auto: TRFL_ENGINE env → thog on PATH → trufflehog.
+resolve_engine() {
+  local want="${1:-auto}"
+  # CLI auto still honors TRFL_ENGINE if set
+  if [[ "$want" == "auto" && -n "${TRFL_ENGINE:-}" ]]; then
+    want="$TRFL_ENGINE"
+  fi
+  want=$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')
+
+  case "$want" in
+    thog)
+      command -v thog >/dev/null 2>&1 || die "engine 'thog' requested but not found on PATH"
+      _engine="thog"
+      ;;
+    trufflehog|stock|upstream)
+      command -v trufflehog >/dev/null 2>&1 || die "engine 'trufflehog' requested but not found on PATH"
+      _engine="trufflehog"
+      ;;
+    auto|"")
+      if command -v thog >/dev/null 2>&1; then
+        _engine="thog"
+      elif command -v trufflehog >/dev/null 2>&1; then
+        _engine="trufflehog"
+      else
+        die "no scanner found — install thog (stealth) or trufflehog"
+      fi
+      ;;
+    *)
+      # Allow a custom binary path or name
+      if command -v "$want" >/dev/null 2>&1; then
+        _engine="$want"
+      elif [[ -x "$want" ]]; then
+        _engine="$want"
+      else
+        die "unknown engine '$want' (use auto|thog|trufflehog or a binary path)"
+      fi
+      ;;
+  esac
+
+  log_verbose "Scanner engine: $_engine ($($_engine --version 2>/dev/null || echo unknown))"
+}
 
 is_archive() {
   local file="$1"
@@ -36,6 +84,60 @@ is_archive() {
     *.zip|*.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.gz|*.bz2|*.xz|*.7z|*.rar) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# ─── LevelDB pre-scan ─────────────────────────────────────────────────────────
+
+# fd on Arch/etc, fdfind on Debian (fd-find package)
+find_fd_bin() {
+  if command -v fd >/dev/null 2>&1; then
+    echo "fd"
+  elif command -v fdfind >/dev/null 2>&1; then
+    echo "fdfind"
+  else
+    return 1
+  fi
+}
+
+# Find LevelDB data files under target (.ldb/.sst tables + numeric WAL .log files),
+# extract `strings` from each into staged text files (grouped per leveldb directory),
+# so trufflehog's raw-byte scan doesn't silently miss their contents.
+stage_leveldb_strings() {
+  local target="$1" stage_dir="$2"
+  local fd_bin
+  fd_bin=$(find_fd_bin) || {
+    log_verbose "fd/fdfind not found — skipping LevelDB pre-scan"
+    return 0
+  }
+
+  local files logs
+  files=$("$fd_bin" -H -I -t f -e ldb -e sst . "$target" 2>/dev/null || true)
+  # LevelDB WAL files are numeric .log (e.g. 000123.log) — avoids matching random app logs
+  logs=$("$fd_bin" -H -I -t f '^[0-9]+\.log$' "$target" 2>/dev/null || true)
+  [[ -n "$logs" ]] && files=$(printf '%s\n%s\n' "$files" "$logs")
+  files=$(printf '%s\n' "$files" | sed '/^$/d' | sort -u)
+
+  [[ -z "$files" ]] && return 0
+
+  mkdir -p "$stage_dir"
+  local count=0
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    local rel_dir safe_name out
+    rel_dir=$(dirname "${f#"$target"/}")
+    safe_name=$(printf '%s' "$rel_dir" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')
+    out="$stage_dir/${safe_name:-root}.strings.txt"
+    {
+      printf '=== %s ===\n' "$f"
+      strings "$f"
+      printf '\n'
+    } >> "$out"
+    ((count++))
+  done <<< "$files"
+
+  if [[ $count -gt 0 ]]; then
+    log "${cyan}::${reset} LevelDB pre-scan: extracted strings from ${bold}${count}${reset} leveldb file(s)"
+  fi
 }
 
 count_archive_files() {
@@ -183,7 +285,7 @@ run_scan() {
       local th_include=""
       [[ -n "${4:-}" ]] && th_include="--include-detectors=$4"
 
-      trufflehog filesystem "$target" --results "$results" -j --log-level=0 \
+      "$_engine" filesystem "$target" --results "$results" -j --log-level=0 \
         ${th_include:+$th_include} \
         > "$jsonl_file" 2>"$stderr_file"
 
@@ -230,7 +332,7 @@ run_scan() {
       local th_include=""
       [[ -n "${4:-}" ]] && th_include="--include-detectors=$4"
 
-      trufflehog filesystem "$target" --results "$results" -j --log-level="$log_level" \
+      "$_engine" filesystem "$target" --results "$results" -j --log-level="$log_level" \
         ${th_include:+$th_include} \
         > "$jsonl_file" 2>"$fifo"
 
@@ -244,8 +346,28 @@ run_scan() {
     local th_include=""
     [[ -n "${4:-}" ]] && th_include="--include-detectors=$4"
 
-    if ! trufflehog filesystem "$target" --results "$results" -j ${th_include:+$th_include} 2>/dev/null > "$jsonl_file"; then
-      die "Trufflehog scan failed"
+    if ! "$_engine" filesystem "$target" --results "$results" -j ${th_include:+$th_include} 2>/dev/null > "$jsonl_file"; then
+      die "$_engine scan failed"
+    fi
+  fi
+
+  # LevelDB pre-scan: string leveldb data files and scan the extracted strings,
+  # so snappy-compressed/unparsed leveldb content still gets checked for secrets
+  if [[ -d "$target" ]] && [[ -z "${argc_no_leveldb:-}" ]]; then
+    local stage_dir
+    stage_dir="${jsonl_file%.jsonl}_leveldb_strings"
+    rm -rf "$stage_dir" # clear stale extractions from previous runs
+    stage_leveldb_strings "$target" "$stage_dir"
+    if [[ -n "$(ls -A "$stage_dir" 2>/dev/null)" ]]; then
+      local th_include=""
+      [[ -n "${4:-}" ]] && th_include="--include-detectors=$4"
+      log_verbose "Scanning staged leveldb strings with $_engine"
+      "$_engine" filesystem "$stage_dir" --results "$results" -j --log-level=0 \
+        ${th_include:+$th_include} \
+        >> "$jsonl_file" 2>/dev/null || true
+      log "${cyan}::${reset} LevelDB strings staged at ${cyan}${stage_dir}/${reset}"
+    else
+      rmdir "$stage_dir" 2>/dev/null || true
     fi
   fi
 
@@ -501,6 +623,10 @@ main() {
   _quiet="${argc_quiet:-}"
   _verbose="${argc_verbose:-}"
   setup_colors "$_quiet"
+
+  resolve_engine "${argc_engine:-auto}"
+  log "${dim}engine:${reset} ${bold}${_engine}${reset}"
+
   validate_results_type "$argc_results"
 
   local target
@@ -561,7 +687,7 @@ _argc_run() {
 
 _argc_usage() {
     cat <<-'EOF'
-Scan target with trufflehog and convert results to CSV
+Scan target with trufflehog/thog and convert results to CSV
 
 USAGE: trfl [OPTIONS] <COMMAND>
 
@@ -571,11 +697,13 @@ ARGS:
 OPTIONS:
   -r, --results <TYPE>                 Results type(s) [verified|unverified|unknown], comma-separated for multiple [default: verified]
   -o, --output <NAME>                  Base name for output files (auto-detected if not provided)
-  -d, --include-detectors <DETECTORS>  Only run specific detectors (comma-separated), passed directly to trufflehog --include-detectors
+  -d, --include-detectors <DETECTORS>  Only run specific detectors (comma-separated), passed directly to the scanner --include-detectors
+  -e, --engine <ENGINE>                Scanner binary: auto (prefer thog), thog (stealth fork), or trufflehog (stock). Env: TRFL_ENGINE [default: auto]
   -j, --json-only                      Output only JSONL, skip CSV conversion
   -s, --split                          Also split results into per-detector files after scanning
   -q, --quiet                          Suppress progress output
   -v, --verbose                        Enable verbose output
+      --no-leveldb                     Skip LevelDB strings pre-scan (strings extraction from .ldb/.sst/.log before scanning dirs)
   -h, --help                           Print help
   -V, --version                        Print version
 
@@ -636,6 +764,15 @@ _argc_parse() {
                 _argc_die "error: the argument \`--include-detectors\` cannot be used multiple times"
             fi
             ;;
+        --engine | -e)
+            _argc_take_args "--engine <ENGINE>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_engine:-}" ]]; then
+                argc_engine="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--engine\` cannot be used multiple times"
+            fi
+            ;;
         --json-only | -j)
             if [[ "$_argc_item" == *=* ]]; then
                 _argc_die "error: flag \`--json-only\` don't accept any value"
@@ -680,6 +817,17 @@ _argc_parse() {
                 argc_verbose=1
             fi
             ;;
+        --no-leveldb)
+            if [[ "$_argc_item" == *=* ]]; then
+                _argc_die "error: flag \`--no-leveldb\` don't accept any value"
+            fi
+            _argc_index=$((_argc_index + 1))
+            if [[ -n "${argc_no_leveldb:-}" ]]; then
+                _argc_die "error: the argument \`--no-leveldb\` cannot be used multiple times"
+            else
+                argc_no_leveldb=1
+            fi
+            ;;
         split)
             _argc_index=$((_argc_index + 1))
             _argc_action=_argc_parse_split
@@ -708,7 +856,7 @@ _argc_parse() {
             ;;
         esac
     done
-    _argc_tools=(trufflehog jq)
+    _argc_tools=(jq)
     if [[ -n "${_argc_action:-}" ]]; then
         $_argc_action
     else
@@ -727,6 +875,9 @@ _argc_parse() {
         fi
         if [[ -z "${argc_results:-}" ]]; then
             argc_results=verified
+        fi
+        if [[ -z "${argc_engine:-}" ]]; then
+            argc_engine=auto
         fi
     fi
 }
@@ -805,7 +956,7 @@ _argc_parse_split() {
             ;;
         esac
     done
-    _argc_tools=(trufflehog jq)
+    _argc_tools=(jq)
     if [[ -n "${_argc_action:-}" ]]; then
         $_argc_action
     else
