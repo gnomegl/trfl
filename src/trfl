@@ -511,12 +511,23 @@ write_split_files() {
     safe_name=$(echo "$detector" | tr ' /' '_-')
     outfile="$outdir/${safe_name}.txt"
 
-    # Generate new entries: each line is RawV2 if non-empty, else Raw
+    # Generate new entries: each line is the full composite credential.
+    # Precedence: RawV2 (TH's own composite) > SecretParts concatenation > Raw.
+    # Multi-part detectors (BoxOauth client_id+client_secret, Cloudinary
+    # key+secret+cloud_name, Razorpay key_id+key_secret, ...) carry the full
+    # pair in SecretParts even when RawV2 comes back empty — without the
+    # parts fallback the txt would hold only the primary fragment from Raw
+    # and the companion half would live in the jsonl alone. Concatenation
+    # follows part insertion order, the same convention TH uses for RawV2
+    # itself (verified against BoxOauth and Cloudinary rows).
     local tmp_new
     tmp_new=$(mktemp)
     jq -r --arg det "$detector" '
       select(.DetectorName == $det) |
-      if (.RawV2 // "") != "" then .RawV2 else .Raw end |
+      if (.RawV2 // "") != "" then .RawV2
+      elif ((.SecretParts // {}) | length) > 0 then
+        [.SecretParts | to_entries[] | (.value // "") | tostring] | join("")
+      else .Raw // "" end |
       gsub("\n"; " ") | gsub("^\\s+|\\s+$"; "")
     ' "$input" | grep -v '^$' > "$tmp_new"
 
