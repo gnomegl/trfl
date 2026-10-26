@@ -11,7 +11,6 @@
 # @flag -s --split Also split results into per-detector files after scanning
 # @flag -q --quiet Suppress progress output
 # @flag -v --verbose Enable verbose output
-# @flag --no-leveldb Skip LevelDB strings pre-scan (strings extraction from .ldb/.sst/.log before scanning dirs)
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -84,60 +83,6 @@ is_archive() {
     *.zip|*.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.gz|*.bz2|*.xz|*.7z|*.rar) return 0 ;;
     *) return 1 ;;
   esac
-}
-
-# ─── LevelDB pre-scan ─────────────────────────────────────────────────────────
-
-# fd on Arch/etc, fdfind on Debian (fd-find package)
-find_fd_bin() {
-  if command -v fd >/dev/null 2>&1; then
-    echo "fd"
-  elif command -v fdfind >/dev/null 2>&1; then
-    echo "fdfind"
-  else
-    return 1
-  fi
-}
-
-# Find LevelDB data files under target (.ldb/.sst tables + numeric WAL .log files),
-# extract `strings` from each into staged text files (grouped per leveldb directory),
-# so trufflehog's raw-byte scan doesn't silently miss their contents.
-stage_leveldb_strings() {
-  local target="$1" stage_dir="$2"
-  local fd_bin
-  fd_bin=$(find_fd_bin) || {
-    log_verbose "fd/fdfind not found — skipping LevelDB pre-scan"
-    return 0
-  }
-
-  local files logs
-  files=$("$fd_bin" -H -I -t f -e ldb -e sst . "$target" 2>/dev/null || true)
-  # LevelDB WAL files are numeric .log (e.g. 000123.log) — avoids matching random app logs
-  logs=$("$fd_bin" -H -I -t f '^[0-9]+\.log$' "$target" 2>/dev/null || true)
-  [[ -n "$logs" ]] && files=$(printf '%s\n%s\n' "$files" "$logs")
-  files=$(printf '%s\n' "$files" | sed '/^$/d' | sort -u)
-
-  [[ -z "$files" ]] && return 0
-
-  mkdir -p "$stage_dir"
-  local count=0
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
-    local rel_dir safe_name out
-    rel_dir=$(dirname "${f#"$target"/}")
-    safe_name=$(printf '%s' "$rel_dir" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')
-    out="$stage_dir/${safe_name:-root}.strings.txt"
-    {
-      printf '=== %s ===\n' "$f"
-      strings "$f"
-      printf '\n'
-    } >> "$out"
-    ((count++))
-  done <<< "$files"
-
-  if [[ $count -gt 0 ]]; then
-    log "${cyan}::${reset} LevelDB pre-scan: extracted strings from ${bold}${count}${reset} leveldb file(s)"
-  fi
 }
 
 count_archive_files() {
@@ -348,26 +293,6 @@ run_scan() {
 
     if ! "$_engine" filesystem "$target" --results "$results" -j ${th_include:+$th_include} 2>/dev/null > "$jsonl_file"; then
       die "$_engine scan failed"
-    fi
-  fi
-
-  # LevelDB pre-scan: string leveldb data files and scan the extracted strings,
-  # so snappy-compressed/unparsed leveldb content still gets checked for secrets
-  if [[ -d "$target" ]] && [[ -z "${argc_no_leveldb:-}" ]]; then
-    local stage_dir
-    stage_dir="${jsonl_file%.jsonl}_leveldb_strings"
-    rm -rf "$stage_dir" # clear stale extractions from previous runs
-    stage_leveldb_strings "$target" "$stage_dir"
-    if [[ -n "$(ls -A "$stage_dir" 2>/dev/null)" ]]; then
-      local th_include=""
-      [[ -n "${4:-}" ]] && th_include="--include-detectors=$4"
-      log_verbose "Scanning staged leveldb strings with $_engine"
-      "$_engine" filesystem "$stage_dir" --results "$results" -j --log-level=0 \
-        ${th_include:+$th_include} \
-        >> "$jsonl_file" 2>/dev/null || true
-      log "${cyan}::${reset} LevelDB strings staged at ${cyan}${stage_dir}/${reset}"
-    else
-      rmdir "$stage_dir" 2>/dev/null || true
     fi
   fi
 
